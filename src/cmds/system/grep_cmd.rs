@@ -33,7 +33,14 @@ pub fn run(
     // Without this, rg returns 0 matches for files in .gitignore, causing
     // false negatives that make AI agents draw wrong conclusions.
     // Using --no-ignore-vcs (not --no-ignore) so .ignore/.rgignore are still respected.
-    rg_cmd.args(["-n", "--no-heading", "--no-ignore-vcs", &rg_pattern, path]);
+    rg_cmd.args([
+        "-n",
+        "--no-heading",
+        "--with-filename",
+        "--no-ignore-vcs",
+        &rg_pattern,
+        path,
+    ]);
 
     if let Some(ft) = file_type {
         rg_cmd.arg("--type").arg(ft);
@@ -108,18 +115,9 @@ pub fn run(
 
     let mut by_file: HashMap<String, Vec<(usize, String)>> = HashMap::new();
     for line in result.stdout.lines() {
-        let parts: Vec<&str> = line.splitn(3, ':').collect();
-
-        let (file, line_num, content) = if parts.len() == 3 {
-            let ln = parts[1].parse().unwrap_or(0);
-            (parts[0].to_string(), ln, parts[2])
-        } else if parts.len() == 2 {
-            let ln = parts[0].parse().unwrap_or(0);
-            (path.to_string(), ln, parts[1])
-        } else {
+        let Some((file, line_num, content)) = parse_rg_line(line, path) else {
             continue;
         };
-
         let cleaned = clean_line(content, max_line_len, context_re.as_ref(), pattern);
         by_file.entry(file).or_default().push((line_num, cleaned));
     }
@@ -181,6 +179,15 @@ fn has_format_flag(extra_args: &[String]) -> bool {
                 | "--null"
         )
     })
+}
+
+fn parse_rg_line<'a>(line: &'a str, fallback_path: &str) -> Option<(String, usize, &'a str)> {
+    let parts: Vec<&str> = line.splitn(3, ':').collect();
+    match parts.as_slice() {
+        [file, ln, content] => Some((file.to_string(), ln.parse().unwrap_or(0), content)),
+        [ln, content] => Some((fallback_path.to_string(), ln.parse().unwrap_or(0), content)),
+        _ => None,
+    }
 }
 
 fn clean_line(line: &str, max_len: usize, context_re: Option<&Regex>, pattern: &str) -> String {
@@ -288,6 +295,26 @@ mod tests {
         let line = "🎉🎊🎈🎁🎂🎄 some text 🎃🎆🎇✨";
         let cleaned = clean_line(line, 15, None, "text");
         assert!(!cleaned.is_empty());
+    }
+
+    #[test]
+    fn test_parse_rg_line_with_colons_in_content() {
+        // --with-filename always prefixes filename; colons in content must not corrupt parsing
+        let line = "test.ts:1:function foo(ctx: ExtensionContext, fallback: boolean): boolean {";
+        let (file, line_num, content) = parse_rg_line(line, "test.ts").unwrap();
+        assert_eq!(file, "test.ts");
+        assert_eq!(line_num, 1);
+        assert!(content.contains("ExtensionContext"));
+    }
+
+    #[test]
+    fn test_parse_rg_line_single_file_fallback() {
+        // Two-part line (linenum:content) falls back to provided path
+        let line = "4:function simpleNoColon() {";
+        let (file, line_num, content) = parse_rg_line(line, "test.ts").unwrap();
+        assert_eq!(file, "test.ts");
+        assert_eq!(line_num, 4);
+        assert_eq!(content, "function simpleNoColon() {");
     }
 
     // Fix: BRE \| alternation is translated to PCRE | for rg
